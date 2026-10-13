@@ -529,7 +529,7 @@ test('acquirePipelineLock: a maxWaitMs of 0 means no waiting, not the default ce
 
 test('acquirePipelineLock: a negative or -Infinity ceiling takes the default rather than becoming zero', async () => {
   const root = fixtureRoot();
-  const churn = churnLock(`${root}/data/pipeline.md.lock`, 20);
+  let held;
   try {
     const p = join(root, 'data', 'pipeline.md');
     // A negative ceiling is a mistake, not a request for no waiting. Clamping it
@@ -537,17 +537,28 @@ test('acquirePipelineLock: a negative or -Infinity ceiling takes the default rat
     // different behaviour; the default is at least bounded and obvious. Paired
     // with the zero test above on purpose — together they pin that 0 and "less
     // than 0" are NOT the same input.
+    //
+    // The blocker is one live holder that never changes hands, not churnLock.
+    // churnLock's progress comes from a timer on the same event loop as the code
+    // under test. A stall on that loop (a slow filesystem call on a busy runner)
+    // can keep the timer from firing between two fingerprint samples. The lock
+    // then looks wedged and the caller gives up well before the default ceiling.
+    // In production the holder is another process, so that stall never starves
+    // it. An unchanging holder makes the lower bound independent of scheduling.
+    // The wedged-holder rule cannot fire before timeoutMs, and a zero clamp
+    // still throws within milliseconds.
+    held = await acquirePipelineLock(p, { timeoutMs: 300, retryMs: 20 });
     for (const bad of [-5, -Infinity]) {
       const startedAt = Date.now();
       const outcome = await settleOrGiveUp(
-        acquirePipelineLock(p, { timeoutMs: 50, retryMs: 20, maxWaitMs: bad }), 3000,
+        acquirePipelineLock(p, { timeoutMs: 300, retryMs: 20, maxWaitMs: bad }), 3000,
       );
       const elapsed = Date.now() - startedAt;
       assert.ok(outcome instanceof LockTimeoutError, `maxWaitMs=${bad}: expected a timeout, got: ${outcome}`);
       assert.ok(elapsed >= 300, `maxWaitMs=${bad} gave up after ${elapsed}ms — clamped to zero instead of defaulting`);
     }
   } finally {
-    churn.stop();
+    held?.release();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -899,6 +910,100 @@ test('createLockWaitPolicy: a re-armed per-holder window still sleeps a full jit
       + 'busy-wait a clamp against the frozen deadline would produce.',
     );
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── #4537: the ownerless grace floor must be reachable from the environment ──
+//
+// Its three siblings all read it, and
+// followup-seed.mjs layers a second set on top. This one is a bare constant,
+// so the single window whose budget process startup spends is the one window a
+// caller cannot widen. followup-seed-tests.mjs test 16 backdates a lock 100ms
+// into that 1s floor and then hands the rest to execFileSync plus Node startup;
+// on a slow runner the lock reads reclaimable, the child steals it and exits 0,
+// and both of test 16's assertions fail together. That is the macOS CI flake.
+//
+// The import is dynamic and cache-busted on purpose. This file's static import
+// above already evaluated the module, and ESM hoists it over any assignment
+// written here, so a plain re-import would read the value captured at load.
+// A value that is not a floor must not be accepted as one. The `|| default`
+// idiom refuses only the falsy ones, so '' and '0' and 'abc' were already safe
+// while '-5' and 'Infinity' were not, and the two fail in opposite directions:
+// a negative collapses Math.max(staleMs, floor) to staleMs, making a directory
+// created microseconds ago reclaimable, and Infinity makes nothing reclaimable
+// ever. Both assertions per case on purpose. Reading the constant back proves
+// the parse; the verdict proves the constant is what the comparison uses, which
+// a fix that validated the export but left a captured 1000 behind would not.
+for (const [label, value] of [
+  ['a negative', '-5'],
+  ['a zero', '0'],
+  ['a non-numeric', 'soon'],
+  ['an empty', ''],
+  ['an infinite', 'Infinity'],
+]) {
+  test(`${label} CAREER_OPS_OWNERLESS_GRACE_MS is refused, not used as the floor`, async () => {
+    const root = mkdtempSync(join(tmpdir(), `grace-bad-${label.replace(/\s/g, '-')}-`));
+    const prior = process.env.CAREER_OPS_OWNERLESS_GRACE_MS;
+    process.env.CAREER_OPS_OWNERLESS_GRACE_MS = value;
+    try {
+      const lock = await import(`../pipeline-lock.mjs?grace-bad-${label.replace(/\s/g, '-')}`);
+      assert.equal(
+        lock.OWNERLESS_GRACE_MS, 1_000,
+        `${label} is not a floor, so the 1000ms default must stand`,
+      );
+      const dir = join(root, 'x.lock');
+      mkdirSync(dir, { recursive: true });
+      backdate(dir, 10); // ownerless and 10ms old: inside any real floor
+      assert.equal(
+        lock.lockRecoveryVerdict(dir, 0), lock.RECOVER_LIVE,
+        `staleMs 0 with a ${label} floor must still refuse to condemn a 10ms-old lock`,
+      );
+    } finally {
+      if (prior === undefined) delete process.env.CAREER_OPS_OWNERLESS_GRACE_MS;
+      else process.env.CAREER_OPS_OWNERLESS_GRACE_MS = prior;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+// Control. Without it every case above would pass on a build that ignored the
+// environment entirely and hard-coded 1000.
+test('a valid CAREER_OPS_OWNERLESS_GRACE_MS is still honored (control)', async () => {
+  const prior = process.env.CAREER_OPS_OWNERLESS_GRACE_MS;
+  process.env.CAREER_OPS_OWNERLESS_GRACE_MS = '2500';
+  try {
+    const lock = await import('../pipeline-lock.mjs?grace-good');
+    assert.equal(lock.OWNERLESS_GRACE_MS, 2_500, 'a finite positive override must reach the floor');
+  } finally {
+    if (prior === undefined) delete process.env.CAREER_OPS_OWNERLESS_GRACE_MS;
+    else process.env.CAREER_OPS_OWNERLESS_GRACE_MS = prior;
+  }
+});
+
+test('the ownerless grace floor honors CAREER_OPS_OWNERLESS_GRACE_MS', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'grace-env-'));
+  const prior = process.env.CAREER_OPS_OWNERLESS_GRACE_MS;
+  process.env.CAREER_OPS_OWNERLESS_GRACE_MS = '30000';
+  try {
+    const lock = await import('../pipeline-lock.mjs?grace-env');
+    const dir = join(root, 'x.lock');
+    mkdirSync(dir, { recursive: true });
+    backdate(dir, 5_000); // ownerless and 5s old: past the 1s default floor
+
+    assert.equal(
+      lock.OWNERLESS_GRACE_MS, 30_000,
+      'the floor is a bare constant, so a caller cannot widen the one window whose budget process startup spends',
+    );
+    // Two assertions on purpose. A fix that exports the number but leaves the
+    // comparison against a captured 1000 would satisfy the first and fail this.
+    assert.equal(
+      lock.lockRecoveryVerdict(dir, 10), lock.RECOVER_LIVE,
+      'a 5s-old ownerless lock is inside a 30s configured floor and must not be reclaimable',
+    );
+  } finally {
+    if (prior === undefined) delete process.env.CAREER_OPS_OWNERLESS_GRACE_MS;
+    else process.env.CAREER_OPS_OWNERLESS_GRACE_MS = prior;
     rmSync(root, { recursive: true, force: true });
   }
 });
